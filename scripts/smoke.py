@@ -108,6 +108,96 @@ def main(base):
     check(code == 200 and v["status"] == "rejected",
           "equidistant epoch candidates (2^31) rejected")
 
+    # --- half-wrap observations: retain, auto-settle, receipt conflicts ---
+    _, anchor_link = request("POST", base + "/api/links",
+                             {"name": "smoke-anchor"})
+    aid = anchor_link["id"]
+    a_frames = f"{base}/api/links/{aid}/frames"
+    a_obs = f"{base}/api/links/{aid}/observations"
+
+    def observe(counter, obs_id, receipt_id, payload=None):
+        return request("POST", a_obs,
+                       {"counter": counter, "observation_id": obs_id,
+                        "receipt_id": receipt_id,
+                        "payload": payload if payload is not None else {"v": 1}})
+
+    def aframe(counter, rid, payload=None):
+        return request("POST", a_frames,
+                       {"counter": counter, "receipt_id": rid,
+                        "payload": payload if payload is not None else {"v": 1}})
+
+    request("POST", a_frames,
+            {"counter": 0, "receipt_id": "a-base", "payload": {"v": 1}})
+
+    # 1) half-wrap retention: anchoring moves neither window nor ledger
+    code, v = observe(HALF, "a-obs-1", "a-orig-1")
+    check(code == 200 and v["status"] == "pending" and v["extended"] is None,
+          "half-wrap frame registered as pending observation")
+    _, state = request("GET", f"{base}/api/links/{aid}")
+    check(state["highest"] == 0 and len(state["observations"]) == 1
+          and state["observations"][0]["status"] == "pending",
+          "anchoring leaves window untouched and lists the pending observation")
+
+    # identical observation retransmission returns the current state
+    code, v = observe(HALF, "a-obs-1", "a-orig-1")
+    check(code == 200 and v["retransmit"] and v["status"] == "pending",
+          "identical observation retransmission returns current state")
+    # any changed association is refused
+    code, _ = observe(HALF, "a-obs-1", "a-orig-1", {"v": 2})
+    check(code == 409, "observation id reused with changed payload -> 409")
+    code, _ = observe(HALF, "a-obs-2", "a-orig-1")
+    check(code == 409, "carried receipt id reused by another observation -> 409")
+
+    # 2) receipt occupation conflict: reserved original receipt cannot enter
+    #    through the ordinary entry (even with identical data)
+    code, body = aframe(HALF, "a-orig-1")
+    check(code == 409 and "reserved" in body["error"],
+          "reserved original receipt sent to ordinary entry -> 409")
+
+    # 3) auto-settlement inside the advancing frame's transaction
+    code, v = aframe(1, "a-advance")
+    check(code == 200 and len(v["settled"]) == 1
+          and v["settled"][0]["observation_id"] == "a-obs-1"
+          and v["settled"][0]["extended"] == HALF
+          and v["highest"] == HALF,
+          "advancing ordinary frame settles the observation at 2^31 in one tx")
+    _, state = request("GET", f"{base}/api/links/{aid}")
+    obs = state["observations"][0]
+    check(obs["status"] == "settled" and obs["verdict"] == "accepted"
+          and obs["extended"] == HALF,
+          "page shows settled observation with its final extended seq")
+    # settled exactly once: a further trigger settles nothing and the ledger
+    # still holds one row (the settled receipt now replays its first verdict)
+    code, v = aframe(2, "a-advance-2")
+    check(code == 200 and v["settled"] == [],
+          "repeated trigger does not re-settle observations")
+    code, v = aframe(HALF, "a-orig-1")
+    check(code == 200 and v["retransmit"] and v["status"] == "accepted",
+          "settled receipt id replays its verdict via the ordinary entry")
+
+    # 4) ordinary reception regression: normal verdicts are unchanged
+    _, reg_link = request("POST", base + "/api/links", {"name": "smoke-reg"})
+    rid = reg_link["id"]
+    r_frames = f"{base}/api/links/{rid}/frames"
+
+    def rframe(counter, r, payload=None):
+        return request("POST", r_frames,
+                       {"counter": counter, "receipt_id": r,
+                        "payload": payload if payload is not None else {"v": 1}})
+
+    _, v = rframe(MOD - 1, "g-1")
+    check(v["status"] == "accepted", "regression: pre-wrap frame accepted")
+    _, v = rframe(0, "g-0")
+    check(v["status"] == "accepted" and v["extended"] == MOD,
+          "regression: counter 0 wraps to 2^32")
+    _, v = rframe(0, "g-0")
+    check(v["retransmit"] and v["status"] == "accepted",
+          "regression: identical retransmission replays first verdict")
+    _, v = rframe(0, "g-dup")
+    check(v["status"] == "duplicate", "regression: duplicate detected")
+    code, _ = rframe(MOD - 1, "g-1", {"v": 9})
+    check(code == 409, "regression: receipt reuse with changed payload -> 409")
+
     # --- input validation ---
     code, _ = request("POST", frames_url,
                       {"counter": MOD, "receipt_id": "bad", "payload": {}})

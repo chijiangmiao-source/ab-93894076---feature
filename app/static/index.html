@@ -67,9 +67,11 @@
   .badge.duplicate { background: rgba(251,191,36,.18); color: var(--dup); }
   .badge.expired { background: rgba(248,113,113,.18); color: var(--exp); }
   .badge.rejected { background: rgba(192,132,252,.18); color: var(--rej); }
+  .badge.pending { background: rgba(79,163,255,.18); color: var(--accent); }
+  .badge.settled { background: rgba(52,211,153,.18); color: var(--ok); }
   .hint { color: var(--muted); font-size: 11.5px; margin-top: 6px; }
   .empty { color: var(--muted); padding: 20px; text-align: center; }
-  #verdict { margin-top: 10px; font-size: 12.5px; min-height: 18px; }
+  #verdict, #anchor-verdict { margin-top: 10px; font-size: 12.5px; min-height: 18px; }
 </style>
 </head>
 <body>
@@ -157,7 +159,7 @@ function renderMain(l) {
 
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:18px">
       <div>
-        <h2>提交到达帧</h2>
+        <h2>提交到达帧（普通入口）</h2>
         <label>无符号 32 位计数 counter</label>
         <input id="f-counter" placeholder="0 .. 4294967295" inputmode="numeric">
         <label>稳定回执标识 receipt_id</label>
@@ -170,9 +172,33 @@ function renderMain(l) {
         receipt_id 复用但改变链路/计数/载荷 → 409 拒绝。</div>
       </div>
       <div>
+        <h2>登记待锚定观测（半距回绕帧）</h2>
+        <label>无符号 32 位计数 counter（须恰距最高序号 2³¹）</label>
+        <input id="o-counter" placeholder="0 .. 4294967295" inputmode="numeric">
+        <label>独立观测标识 observation_id</label>
+        <input id="o-obsid" placeholder="例如 obs-0001">
+        <label>原帧回执标识 receipt_id</label>
+        <input id="o-receipt" placeholder="例如 tx-0042">
+        <label>载荷 payload（任意 JSON）</label>
+        <textarea id="o-payload">{"sensor":"temp","value":2.7}</textarea>
+        <button onclick="anchorObservation()">登记观测</button>
+        <div id="anchor-verdict"></div>
+        <div class="hint">登记不动窗口、不写回执账本；相同观测重传返回当前状态。
+        任一标识改换关联数据、或原帧回执直投普通入口 → 409 拒绝。</div>
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:18px">
+      <div>
         <h2>最近 64 个已接受位置（扩展序号）</h2>
         <table><thead><tr><th>extended sequence</th></tr></thead>
         <tbody id="m-recent"></tbody></table>
+      </div>
+      <div>
+        <h2>待锚定 / 已结算观测</h2>
+        <table><thead><tr><th>状态</th><th>观测标识</th><th>原帧回执</th><th>counter</th><th>最终扩展序号</th><th>裁决</th></tr></thead>
+        <tbody id="m-observations"></tbody></table>
+        <div class="hint">普通帧推进最高序号后在同一事务内自动重判结算；未能解除歧义的观测保持待定。</div>
       </div>
     </div>`;
   document.getElementById("m-name").textContent = l.name;
@@ -192,9 +218,34 @@ function refreshState(l) {
     bits.push(`<div class="bit ${set ? 'set' : ''}" title="highest - ${i}">${i}</div>`);
   }
   bitsEl.innerHTML = bits.join("");
+  const obsEl = document.getElementById("m-observations");
+  if (obsEl) renderObservations(l.observations || []);
   recentEl.innerHTML = (l.recent && l.recent.length)
     ? l.recent.map(n => `<tr><td class="mono">${n}</td></tr>`).join("")
     : '<tr><td class="empty">暂无</td></tr>';
+}
+
+function renderObservations(obs) {
+  const obsEl = document.getElementById("m-observations");
+  if (!obsEl) return;
+  if (!obs.length) {
+    obsEl.innerHTML = '<tr><td colspan="6" class="empty">尚无观测</td></tr>';
+    return;
+  }
+  const verdictLabel = { accepted: "接受", duplicate: "重复", expired: "过期", rejected: "拒绝" };
+  obsEl.innerHTML = obs.map(o => {
+    const isPending = o.status === "pending";
+    const ext = isPending ? "—" : String(o.extended);
+    const verdict = isPending ? "—" : (verdictLabel[o.verdict] || o.verdict);
+    return `<tr>
+      <td><span class="badge ${o.status}">${isPending ? "待定" : "已结算"}</span></td>
+      <td class="mono">${escapeHtml(o.observation_id)}</td>
+      <td class="mono">${escapeHtml(o.receipt_id)}</td>
+      <td class="mono">${o.counter}</td>
+      <td class="mono">${ext}</td>
+      <td><span class="badge ${isPending ? 'pending' : o.verdict}">${verdict}</span></td>
+    </tr>`;
+  }).join("");
 }
 
 async function submitFrame() {
@@ -218,15 +269,53 @@ async function submitFrame() {
   }
   const d = r.data;
   const label = { accepted: "接受", duplicate: "重复", expired: "过期", rejected: "拒绝(纪元并列)" }[d.status];
+  const settledNote = (d.settled && d.settled.length)
+    ? ` · 同事务结算观测 <b>${d.settled.length}</b> 项` : "";
   box.innerHTML = `<span class="badge ${d.status}">${label}</span>
     扩展序号 <b>${d.extended}</b> · 最高 <b>${d.highest}</b>
-    ${d.retransmit ? "· 重传回放首次裁决" : ""}`;
+    ${d.retransmit ? "· 重传回放首次裁决" : ""}${settledNote}`;
+  const fresh = await api("GET", "/api/links/" + currentLink);
+  if (fresh.ok) refreshState(fresh.data);
+}
+
+async function anchorObservation() {
+  const counterRaw = document.getElementById("o-counter").value.trim();
+  const obsId = document.getElementById("o-obsid").value.trim();
+  const receipt = document.getElementById("o-receipt").value.trim();
+  let payload;
+  try { payload = JSON.parse(document.getElementById("o-payload").value || "null"); }
+  catch { setAnchorVerdict("载荷不是合法 JSON"); return; }
+  if (!counterRaw || !obsId || !receipt) {
+    setAnchorVerdict("counter / observation_id / receipt_id 均必填"); return;
+  }
+  if (!/^\d+$/.test(counterRaw)) { setAnchorVerdict("counter 必须是无符号整数"); return; }
+  const counter = Number(counterRaw);
+  if (counter > 4294967295) { setAnchorVerdict("counter 超出 32 位范围"); return; }
+
+  const r = await api("POST", `/api/links/${currentLink}/observations`,
+    { counter, observation_id: obsId, receipt_id: receipt, payload });
+  const box = document.getElementById("anchor-verdict");
+  if (!r.ok) {
+    box.innerHTML = `<span class="badge rejected">HTTP ${r.status}</span>
+      <span style="color:var(--exp)">${escapeHtml(r.data.error || "")}</span>`;
+    return;
+  }
+  const d = r.data;
+  const ext = d.extended === null || d.extended === undefined ? "—" : d.extended;
+  box.innerHTML = `<span class="badge ${d.status}">${d.status === "pending" ? "已登记·待定" : "已结算"}</span>
+    观测 <b>${escapeHtml(d.observation_id)}</b> · counter <b>${d.counter}</b>
+    · 最终扩展序号 <b>${ext}</b>${d.retransmit ? " · 重传返回当前状态" : ""}`;
   const fresh = await api("GET", "/api/links/" + currentLink);
   if (fresh.ok) refreshState(fresh.data);
 }
 
 function setVerdict(msg) {
   document.getElementById("verdict").innerHTML =
+    `<span class="badge rejected">${escapeHtml(msg)}</span>`;
+}
+
+function setAnchorVerdict(msg) {
+  document.getElementById("anchor-verdict").innerHTML =
     `<span class="badge rejected">${escapeHtml(msg)}</span>`;
 }
 

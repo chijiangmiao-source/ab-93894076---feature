@@ -123,5 +123,118 @@ class TestHTTP(unittest.TestCase):
         self.assertEqual(v["status"], "rejected")
 
 
+class TestObservationHTTP(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        db_path = os.path.join(cls.tmp.name, "obs.db")
+        cls.server = Server(("127.0.0.1", 0), db_path, log_file=open(os.devnull, "w"))
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.port}"
+        for _ in range(50):
+            try:
+                _request("GET", cls.base + "/healthz")
+                break
+            except OSError:
+                time.sleep(0.05)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.db.close()
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        import uuid
+        _, link = _request("POST", self.base + "/api/links", {"name": "obs"})
+        self.lid = link["id"]
+        self.token = uuid.uuid4().hex[:8]
+        _request("POST", f"{self.base}/api/links/{self.lid}/frames",
+                 {"counter": 0, "receipt_id": f"base-{self.token}",
+                  "payload": {"v": 1}})
+
+    def anchor(self, counter=HALF, obs_id=None, receipt=None, payload=None):
+        obs_id = obs_id or f"obs-{self.token}"
+        receipt = receipt or f"orig-{self.token}"
+        return _request(
+            "POST", f"{self.base}/api/links/{self.lid}/observations",
+            {"counter": counter, "observation_id": obs_id,
+             "receipt_id": receipt,
+             "payload": payload if payload is not None else {"v": 1}})
+
+    def frame(self, counter, rid, payload=None):
+        return _request(
+            "POST", f"{self.base}/api/links/{self.lid}/frames",
+            {"counter": counter, "receipt_id": f"{rid}-{self.token}",
+             "payload": payload if payload is not None else {"v": 1}})
+
+    def test_anchor_retain_and_settle(self):
+        code, v = self.anchor()
+        self.assertEqual(code, 200)
+        self.assertEqual(v["status"], "pending")
+        self.assertIsNone(v["extended"])
+
+        # identical observation retransmission returns current state
+        code, v = self.anchor()
+        self.assertEqual(code, 200)
+        self.assertTrue(v["retransmit"])
+        self.assertEqual(v["status"], "pending")
+
+        # state page lists the pending observation
+        _, link = _request("GET", f"{self.base}/api/links/{self.lid}")
+        self.assertEqual(link["highest"], 0)
+        self.assertEqual(link["observations"][0]["observation_id"],
+                         f"obs-{self.token}")
+        self.assertEqual(link["observations"][0]["status"], "pending")
+
+        # ordinary advancement settles it in the same transaction
+        code, v = self.frame(1, "advance")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(v["settled"]), 1)
+        self.assertEqual(v["settled"][0]["extended"], HALF)
+        self.assertEqual(v["highest"], HALF)
+        _, link = _request("GET", f"{self.base}/api/links/{self.lid}")
+        obs = link["observations"][0]
+        self.assertEqual(obs["status"], "settled")
+        self.assertEqual(obs["verdict"], "accepted")
+        self.assertEqual(obs["extended"], HALF)
+
+    def test_anchor_conflicts(self):
+        self.anchor()
+        # changed payload on same observation id -> 409
+        code, _ = self.anchor(payload={"v": 2})
+        self.assertEqual(code, 409)
+        # carried receipt id reused by another observation -> 409
+        code, _ = self.anchor(obs_id=f"obs-other-{self.token}")
+        self.assertEqual(code, 409)
+        # reserved original receipt sent to the ordinary entry -> 409
+        code, body = self.frame(HALF, "orig")
+        self.assertEqual(code, 409)
+        self.assertIn("reserved", body["error"])
+        # window never moved
+        _, link = _request("GET", f"{self.base}/api/links/{self.lid}")
+        self.assertEqual(link["highest"], 0)
+
+    def test_anchor_requires_half_wrap(self):
+        code, _ = _request(
+            "POST", f"{self.base}/api/links/{self.lid}/observations",
+            {"counter": HALF - 1, "observation_id": f"x-{self.token}",
+             "receipt_id": f"r-{self.token}", "payload": {}})
+        self.assertEqual(code, 400)
+
+    def test_anchor_validation_and_unknown_link(self):
+        code, _ = _request(
+            "POST", f"{self.base}/api/links/{self.lid}/observations",
+            {"counter": HALF, "receipt_id": f"r-{self.token}", "payload": {}})
+        self.assertEqual(code, 400)             # missing observation_id
+        code, _ = _request(
+            "POST", f"{self.base}/api/links/nope/observations",
+            {"counter": HALF, "observation_id": "o",
+             "receipt_id": "r", "payload": {}})
+        self.assertEqual(code, 404)
+
+
 if __name__ == "__main__":
     unittest.main()

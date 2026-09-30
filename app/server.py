@@ -1,15 +1,20 @@
 """HTTP API + static page for the deep-space frame receiver.
 
 Endpoints
-    GET  /                       static single-page UI
-    GET  /healthz                liveness probe -> 200 {"status":"ok"}
-    GET  /api/links              list links with window state
-    POST /api/links              {"name": ...} -> create link
-    GET  /api/links/{id}         link state (highest extended seq + bitmap)
-    POST /api/links/{id}/frames   submit an arriving frame
+    GET  /                            static single-page UI
+    GET  /healthz                     liveness probe -> 200 {"status":"ok"}
+    GET  /api/links                   list links with window state
+    POST /api/links                   {"name": ...} -> create link
+    GET  /api/links/{id}              link state (highest extended seq, bitmap,
+                                      pending/settled observations)
+    POST /api/links/{id}/frames       submit an arriving frame
+    POST /api/links/{id}/observations register a half-wrap frame as a pending
+                                      observation to anchor later
 
-Frame body: {"counter": <u32>, "receipt_id": "...", "payload": ...}
-Verdict:    {"status": "accepted|duplicate|expired|rejected", ...}
+Frame body:       {"counter": <u32>, "receipt_id": "...", "payload": ...}
+Observation body: {"counter": <u32>, "receipt_id": "...",
+                   "observation_id": "...", "payload": ...}
+Verdict:          {"status": "accepted|duplicate|expired|rejected", ...}
 """
 
 import json
@@ -17,7 +22,7 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from .db import Database, ReceiptConflict
+from .db import Database, NotAnchorable, ReceiptConflict
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 COUNTER_MAX = (1 << 32) - 1
@@ -86,13 +91,22 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(201, link)
             elif path.startswith("/api/links/") and path.endswith("/frames"):
                 self._submit_frame(path.split("/")[3])
+            elif (path.startswith("/api/links/")
+                  and path.endswith("/observations")):
+                self._anchor_observation(path.split("/")[3])
             else:
                 self._send_json(404, {"error": "not found"})
         except _BadRequest as exc:
             self._send_json(400, {"error": str(exc)})
+        except NotAnchorable:
+            self._send_json(400, {"error": "frame is not exactly half a wrap "
+                                           "(2^31) away from the current "
+                                           "highest; it cannot be anchored"})
         except ReceiptConflict:
-            self._send_json(409, {"error": "receipt id reused with a different "
-                                           "link, counter or payload"})
+            self._send_json(409, {"error": "receipt or observation id reused "
+                                           "with different data, or the "
+                                           "receipt id is reserved by a "
+                                           "pending observation"})
         except LookupError:
             self._send_json(404, {"error": "unknown link"})
 
@@ -113,6 +127,27 @@ class Handler(BaseHTTPRequestHandler):
             link_id, counter, str(data["receipt_id"]), payload
         )
         self._send_json(200, verdict)
+
+    def _anchor_observation(self, link_id):
+        data = self._read_json()
+        if "counter" not in data:
+            raise _BadRequest("counter is required")
+        if "receipt_id" not in data or not str(data["receipt_id"]).strip():
+            raise _BadRequest("receipt_id is required")
+        if ("observation_id" not in data
+                or not str(data["observation_id"]).strip()):
+            raise _BadRequest("observation_id is required")
+        try:
+            counter = int(data["counter"])
+        except (TypeError, ValueError):
+            raise _BadRequest("counter must be an integer")
+        if not 0 <= counter <= COUNTER_MAX:
+            raise _BadRequest("counter must be an unsigned 32-bit integer")
+        result = self._db().anchor_observation(
+            link_id, counter, str(data["observation_id"]),
+            str(data["receipt_id"]), data.get("payload"),
+        )
+        self._send_json(200, result)
 
     def _serve_index(self):
         try:
