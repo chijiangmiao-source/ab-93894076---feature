@@ -101,6 +101,28 @@ def decide(counter, highest, bitmap):
     return "accepted", highest, bitmap | bit
 
 
+def rejudge(counter, highest, bitmap):
+    """Re-evaluate a frame that was once exactly half a wrap away.
+
+    A pending observation was parked because the two epoch-adjacent
+    candidates were equidistant from the then-highest seq.  After ordinary
+    frames move the window on, re-running the nearest-epoch resolution may
+    disambiguate it.
+
+    Returns ``None`` while the candidates are still tied (the observation
+    must remain pending); otherwise returns
+    ``(status, extended, new_highest, new_bitmap)`` -- the ordinary verdict
+    the frame gets against the current window, which is never ``rejected``
+    once the tie is broken.
+    """
+    counter &= COUNTER_MAX
+    extended, ambiguous = extend_counter(counter, highest)
+    if ambiguous:
+        return None
+    status, new_highest, new_bitmap = decide(counter, highest, bitmap)
+    return status, extended, new_highest, new_bitmap
+
+
 def recent_positions(highest, bitmap, limit=WINDOW_SIZE):
     """Return the up-to-``limit`` accepted extended seq numbers, newest first.
 

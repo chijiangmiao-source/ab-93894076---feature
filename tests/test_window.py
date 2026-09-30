@@ -145,6 +145,46 @@ class TestDecide(unittest.TestCase):
         self.assertEqual(status, "expired")
 
 
+class TestRejudge(unittest.TestCase):
+    def test_still_tied_returns_none(self):
+        # highest 0, counter HALF is equidistant; rejudging against the same
+        # window keeps it ambiguous -> stays pending.
+        self.assertIsNone(win.rejudge(HALF, 0, 1))
+
+    def test_forward_motion_disambiguates_to_current_epoch(self):
+        # highest advances to HALF-3: counter HALF is now only 3 above it in
+        # epoch 0 (the epoch-1 reading is ~2^32 away) -> settles as an
+        # accepted frame that slides the window on to HALF.
+        verdict = win.rejudge(HALF, HALF - 3, 1 << 0)
+        self.assertIsNotNone(verdict)
+        status, extended, new_highest, _ = verdict
+        self.assertEqual(status, "accepted")
+        self.assertEqual(extended, HALF)
+        self.assertEqual(new_highest, HALF)
+
+    def test_rising_window_across_wrap_picks_next_epoch(self):
+        # Tie around highest HALF: wire counter 0 has candidates 0 and MOD.
+        # Once the window rises to HALF+2, MOD is nearer (HALF-2 away) and
+        # the frame settles into epoch 1, sliding the window to MOD.
+        verdict = win.rejudge(0, HALF + 2, 1 << 0)
+        self.assertIsNotNone(verdict)
+        status, extended, new_highest, _ = verdict
+        self.assertEqual(status, "accepted")
+        self.assertEqual(extended, MOD)
+        self.assertEqual(new_highest, MOD)
+
+    def test_settled_duplicate_when_bit_already_set(self):
+        # If the disambiguated position is already in the bitmap the parked
+        # frame settles as a duplicate and leaves the window untouched.
+        _, h, b = win.decide(HALF, None, 0)
+        _, h, b = win.decide(HALF - 1, h, b)
+        # counter HALF seen via a different receipt after the window moved:
+        verdict = win.rejudge(HALF, h, b)
+        self.assertIsNotNone(verdict)
+        self.assertEqual(verdict[0], "duplicate")
+        self.assertEqual(verdict[2], h)
+
+
 class TestRecentPositions(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(win.recent_positions(None, 0), [])

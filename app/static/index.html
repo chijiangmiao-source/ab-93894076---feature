@@ -67,6 +67,7 @@
   .badge.duplicate { background: rgba(251,191,36,.18); color: var(--dup); }
   .badge.expired { background: rgba(248,113,113,.18); color: var(--exp); }
   .badge.rejected { background: rgba(192,132,252,.18); color: var(--rej); }
+  .badge.pending { background: rgba(79,163,255,.2); color: var(--accent); }
   .hint { color: var(--muted); font-size: 11.5px; margin-top: 6px; }
   .empty { color: var(--muted); padding: 20px; text-align: center; }
   #verdict { margin-top: 10px; font-size: 12.5px; min-height: 18px; }
@@ -174,6 +175,38 @@ function renderMain(l) {
         <table><thead><tr><th>extended sequence</th></tr></thead>
         <tbody id="m-recent"></tbody></table>
       </div>
+    </div>
+
+    <div style="margin-top:20px;border-top:1px solid var(--line);padding-top:16px">
+      <h2 style="margin-top:0">🧷 待锚定观测（回绕半距 2³¹）</h2>
+      <div class="hint" style="margin-bottom:12px">
+        计数恰与当前最高扩展序号相差半个回绕周期时，纪元无法定位。可在此登记为待锚定观测：
+        <b>不移动窗口、不写普通回执裁决</b>。携带独立观测标识与原帧回执标识；
+        相同观测标识重传返回当前状态，任一标识改换关联数据将被拒绝，原帧回执不得再投普通入口。
+        后续普通帧推进最高序号后，服务在同一事务内按观测标识顺序自动重判并仅结算一次。
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+        <div class="panel" style="background:var(--panel2)">
+          <h2 style="margin-top:0">登记待锚定观测</h2>
+          <label>无符号 32 位计数 counter（须恰好相差 2³¹）</label>
+          <input id="o-counter" placeholder="0 .. 4294967295" inputmode="numeric">
+          <label>独立观测标识 observation_id</label>
+          <input id="o-obsid" placeholder="例如 obs-0001">
+          <label>原帧回执标识 original_receipt_id</label>
+          <input id="o-receipt" placeholder="例如 tx-0001">
+          <label>载荷 payload（任意 JSON，须与原帧一致）</label>
+          <textarea id="o-payload">{"sensor":"temp","value":2.7}</textarea>
+          <button onclick="anchorObservation()">登记 / 重传查询</button>
+          <div id="obs-verdict"></div>
+        </div>
+        <div>
+          <h2 style="margin-top:0">观测列表（待定 + 已结算）</h2>
+          <table>
+            <thead><tr><th>观测标识</th><th>原帧回执</th><th>计数</th><th>状态</th><th>最终扩展序号</th></tr></thead>
+            <tbody id="m-observations"></tbody>
+          </table>
+        </div>
+      </div>
     </div>`;
   document.getElementById("m-name").textContent = l.name;
   document.getElementById("m-id").textContent = l.id.slice(0, 12) + "…";
@@ -195,6 +228,33 @@ function refreshState(l) {
   recentEl.innerHTML = (l.recent && l.recent.length)
     ? l.recent.map(n => `<tr><td class="mono">${n}</td></tr>`).join("")
     : '<tr><td class="empty">暂无</td></tr>';
+  renderObservations(l.observations || []);
+}
+
+const OBS_STATUS_LABEL = {
+  pending: "待定", accepted: "已接受", duplicate: "重复",
+  expired: "过期", rejected: "拒绝(纪元并列)",
+};
+
+function renderObservations(obs) {
+  const el = document.getElementById("m-observations");
+  if (!el) return;
+  if (!obs.length) {
+    el.innerHTML = '<tr><td colspan="5" class="empty">尚无观测</td></tr>';
+    return;
+  }
+  // pending first, then settled; within each group keep server order
+  const rank = { pending: 0 };
+  const sorted = obs.slice().sort((a, b) =>
+    (rank[a.status] ?? 1) - (rank[b.status] ?? 1));
+  el.innerHTML = sorted.map(o => `
+    <tr>
+      <td class="mono">${escapeHtml(o.observation_id)}</td>
+      <td class="mono">${escapeHtml(o.original_receipt_id)}</td>
+      <td class="mono">${o.counter}</td>
+      <td><span class="badge ${o.status}">${OBS_STATUS_LABEL[o.status] || o.status}</span></td>
+      <td class="mono">${o.extended === null || o.extended === undefined ? "—" : o.extended}</td>
+    </tr>`).join("");
 }
 
 async function submitFrame() {
@@ -218,11 +278,51 @@ async function submitFrame() {
   }
   const d = r.data;
   const label = { accepted: "接受", duplicate: "重复", expired: "过期", rejected: "拒绝(纪元并列)" }[d.status];
+  let extra = "";
+  if (d.settled_observations && d.settled_observations.length) {
+    const lines = d.settled_observations.map(s =>
+      `${escapeHtml(s.observation_id)} → ${OBS_STATUS_LABEL[s.status] || s.status} @ ${s.extended}`).join("；");
+    extra = `<div class="hint" style="color:var(--ok);margin-top:4px">同事务自动结算观测：${lines}</div>`;
+  }
   box.innerHTML = `<span class="badge ${d.status}">${label}</span>
     扩展序号 <b>${d.extended}</b> · 最高 <b>${d.highest}</b>
-    ${d.retransmit ? "· 重传回放首次裁决" : ""}`;
+    ${d.retransmit ? "· 重传回放首次裁决" : ""}${extra}`;
   const fresh = await api("GET", "/api/links/" + currentLink);
   if (fresh.ok) refreshState(fresh.data);
+}
+
+async function anchorObservation() {
+  const counterRaw = document.getElementById("o-counter").value.trim();
+  const obsId = document.getElementById("o-obsid").value.trim();
+  const receipt = document.getElementById("o-receipt").value.trim();
+  let payload;
+  try { payload = JSON.parse(document.getElementById("o-payload").value || "null"); }
+  catch { setObsVerdict("载荷不是合法 JSON"); return; }
+  if (!counterRaw || !obsId || !receipt) { setObsVerdict("counter / observation_id / original_receipt_id 均必填"); return; }
+  if (!/^\d+$/.test(counterRaw)) { setObsVerdict("counter 必须是无符号整数"); return; }
+  const counter = Number(counterRaw);
+  if (counter > 4294967295) { setObsVerdict("counter 超出 32 位范围"); return; }
+
+  const r = await api("POST", `/api/links/${currentLink}/observations`,
+    { counter, observation_id: obsId, original_receipt_id: receipt, payload });
+  const box = document.getElementById("obs-verdict");
+  if (!r.ok) {
+    box.innerHTML = `<span class="badge rejected">HTTP ${r.status}</span>
+      <span style="color:var(--exp)">${escapeHtml(r.data.error || "")}</span>`;
+    return;
+  }
+  const o = r.data.observation;
+  const re = r.data.retransmit ? "（相同观测标识重传 · 返回当前状态）" : "（已登记，窗口与回执账本未改动）";
+  box.innerHTML = `<span class="badge ${o.status}">${OBS_STATUS_LABEL[o.status] || o.status}</span>
+    计数 <b>${o.counter}</b>${o.extended !== null && o.extended !== undefined ? ` · 最终扩展序号 <b>${o.extended}</b>` : ""}
+    <div class="hint">${re}</div>`;
+  const fresh = await api("GET", "/api/links/" + currentLink);
+  if (fresh.ok) refreshState(fresh.data);
+}
+
+function setObsVerdict(msg) {
+  document.getElementById("obs-verdict").innerHTML =
+    `<span class="badge rejected">${escapeHtml(msg)}</span>`;
 }
 
 function setVerdict(msg) {
